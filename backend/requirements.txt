@@ -8,7 +8,9 @@ dnspython
 
 Pillow
 rembg
-opencv-python
+onnxruntime
+mistralai
+opencv-python-headless
 numpy
 scikit-image
 scipy

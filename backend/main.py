@@ -20,11 +20,18 @@ import cv2
 import zipfile
 from datetime import datetime
 
-# Load environment variables
-load_dotenv()
+# Load environment variables FIRST before anything else
+env_path = os.path.join(os.path.dirname(__file__), ".env")
+if os.path.exists(env_path):
+    load_dotenv(env_path)
+    print(f"[Env] Loaded from {env_path}")
+else:
+    load_dotenv()
+    print("[Env] Loaded from default (CWD)")
 
 MONGO_URI = os.getenv("MONGODB_URI")
 DB_NAME = os.getenv("DB_NAME", "RetailorAI")
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 
 # Initialize FastAPI
 app = FastAPI(title="ReTailor AI Backend")
@@ -43,6 +50,27 @@ client = MongoClient(MONGO_URI)
 db = client[DB_NAME]
 fs = gridfs.GridFS(db)
 
+# Mistral AI client
+try:
+    from mistralai import Mistral
+    if MISTRAL_API_KEY:
+        mistral_client = Mistral(api_key=MISTRAL_API_KEY)
+        print(f"[Mistral] Client initialized OK (API Key: {MISTRAL_API_KEY[:4]}...{MISTRAL_API_KEY[-4:]})")
+    else:
+        mistral_client = None
+        print("[Mistral] WARNING: MISTRAL_API_KEY not set")
+except Exception as e:
+    mistral_client = None
+    print(f"[Mistral] Error initializing: {e}")
+    # Fallback to old SDK naming if new one fails (less likely now with re-install)
+    try:
+        from mistralai.client import MistralClient as Mistral
+        if MISTRAL_API_KEY:
+            mistral_client = Mistral(api_key=MISTRAL_API_KEY)
+            print(f"[Mistral] Fallback: Old SDK MistralClient initialized OK")
+    except Exception as e2:
+        print(f"[Mistral] Fallback also failed: {e2}")
+
 # Create folders
 os.makedirs("tmp", exist_ok=True)
 os.makedirs("processed", exist_ok=True)
@@ -53,6 +81,32 @@ def pil_to_bytes(img: Image.Image):
     img.save(buf, format="PNG")
     buf.seek(0)
     return buf
+
+# Smart background removal — uses rembg (high quality) with GrabCut fallback
+def smart_remove_background(image: Image.Image) -> Image.Image:
+    """Remove background using rembg (AI), falling back to OpenCV GrabCut."""
+    try:
+        from rembg import remove as rembg_remove
+        return rembg_remove(image)
+    except Exception as e:
+        print(f"[rembg] AI removal failed, using GrabCut fallback: {e}")
+        try:
+            img_cv = cv2.cvtColor(np.array(image.convert("RGB")), cv2.COLOR_RGB2BGR)
+            mask = np.zeros(img_cv.shape[:2], np.uint8)
+            bgd_model = np.zeros((1, 65), np.float64)
+            fgd_model = np.zeros((1, 65), np.float64)
+            h, w = img_cv.shape[:2]
+            rect = (int(w*0.05), int(h*0.05), int(w*0.9), int(h*0.9))
+            cv2.grabCut(img_cv, mask, rect, bgd_model, fgd_model, 5, cv2.GC_INIT_WITH_RECT)
+            mask2 = np.where((mask == 2) | (mask == 0), 0, 255).astype('uint8')
+            result = image.convert("RGBA")
+            r, g, b, a = result.split()
+            alpha = Image.fromarray(mask2)
+            result.putalpha(alpha)
+            return result
+        except Exception as e2:
+            print(f"[GrabCut] Fallback also failed: {e2}")
+            return image
 
 #AI Creative Builder Endpoints
 # 1. UPLOAD ASSET (store in GridFS + save to /tmp)
@@ -84,7 +138,7 @@ def remove_background_by_id(file_id: str):
         file_obj = fs.get(ObjectId(file_id))
         image = Image.open(io.BytesIO(file_obj.read())).convert("RGBA")
 
-        output = remove(image)
+        output = smart_remove_background(image)
 
         # save processed image to bytes
         buffer = pil_to_bytes(output)
@@ -237,20 +291,43 @@ def snapshot_project(project_id):
 def create_project(
     width: int = 1080,
     height: int = 1080,
-    background_color: str = "#FFFFFF"
+    background_color: str = "#FFFFFF",
+    name: str = "Untitled Project"
 ):
+    now = datetime.utcnow().isoformat()
     project = {
+        "name": name,
         "width": width,
         "height": height,
         "background_color": background_color,
         "layers": [],
-        "history": [],   # <-- REQUIRED
-        "future": []     # <-- REQUIRED
+        "history": [],
+        "future": [],
+        "created_at": now,
+        "updated_at": now,
     }
 
     result = db.editor_projects.insert_one(project)
 
     return {"status": "success", "project_id": str(result.inserted_id)}
+
+# LIST ALL PROJECTS (for Dashboard)
+@app.get("/editor/projects")
+def list_projects():
+    projects = []
+    for p in db.editor_projects.find({}, {"history": 0, "future": 0}).sort("created_at", -1):
+        layers = p.get("layers", [])
+        projects.append({
+            "id": str(p["_id"]),
+            "name": p.get("name", "Untitled Project"),
+            "width": p.get("width", 1080),
+            "height": p.get("height", 1080),
+            "background_color": p.get("background_color", "#FFFFFF"),
+            "layers_count": len(layers),
+            "created_at": p.get("created_at", datetime.utcnow().isoformat()),
+            "updated_at": p.get("updated_at", datetime.utcnow().isoformat()),
+        })
+    return {"status": "success", "projects": projects}
 
 # 2) ADD IMAGE LAYER
 @app.post("/editor/{project_id}/add-image-layer")
@@ -343,6 +420,19 @@ def update_layer(project_id: str, layer_id: str, updates: dict):
     )
     return {"status": "success", "updated": updates}
 
+# 4.5) SET ALL LAYERS (synchronize entire array)
+class SetLayersRequest(BaseModel):
+    layers: list[dict]
+
+@app.put("/editor/{project_id}/set-layers")
+def set_layers(project_id: str, req: SetLayersRequest):
+    snapshot_project(project_id)
+    db.editor_projects.update_one(
+        {"_id": ObjectId(project_id)},
+        {"$set": {"layers": req.layers}}
+    )
+    return {"status": "success"}
+
 # 5) GET FULL PROJECT (all layers)
 @app.get("/editor/{project_id}")
 def get_editor_project(project_id: str):
@@ -357,59 +447,25 @@ def get_editor_project(project_id: str):
 # 6) RENDER FINAL CREATIVE (MERGE ALL LAYERS)
 @app.get("/editor/{project_id}/render")
 def render_project(project_id: str):
-    project = db.editor_projects.find_one({"_id": ObjectId(project_id)})
-
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-
-    # Base canvas
-    canvas = Image.new("RGBA", (project["width"], project["height"]), project["background_color"])
-
-    for layer in project["layers"]:
-        if layer["type"] == "image":
-            try:
-                file_obj = fs.get(ObjectId(layer["file_id"]))
-            except (InvalidId, Exception):
-                print("Skipping invalid image layer:", layer["file_id"])
-            continue
-            img = Image.open(io.BytesIO(file_obj.read())).convert("RGBA")
-
-            img = img.resize((layer["width"], layer["height"]))
-
-            if layer["rotation"] != 0:
-                img = img.rotate(layer["rotation"], expand=True)
-
-            # Apply opacity
-            if layer["opacity"] < 1.0:
-                alpha = img.split()[3]
-                alpha = alpha.point(lambda p: p * layer["opacity"])
-                img.putalpha(alpha)
-
-            canvas.paste(img, (layer["x"], layer["y"]), img)
-
-        elif layer["type"] == "text":
-            from PIL import ImageDraw, ImageFont
-
-            draw = ImageDraw.Draw(canvas)
-
-            try:
-                font = ImageFont.truetype("arial.ttf", layer["font_size"])
-            except:
-                font = ImageFont.load_default()
-
-            draw.text((layer["x"], layer["y"]), layer["text"], fill=layer["color"], font=font)
-
-    # save to GridFS
-    buffer = io.BytesIO()
-    canvas.save(buffer, format="PNG")
-    buffer.seek(0)
-
-    new_file_id = fs.put(buffer.getvalue(), filename=f"{project_id}_final.png", content_type="image/png")
-
-    return {
-        "status": "success",
-        "rendered_file_id": str(new_file_id)
-    }
+    try:
+        canvas = render_project_image(project_id)
+        
+        # Save logic to GridFS keeping the previous behavior
+        buffer = io.BytesIO()
+        canvas.save(buffer, format="PNG")
+        buffer.seek(0)
+        
+        # Push to gridfs just in case users want to see recent renders
+        fs.put(buffer.getvalue(), filename=f"{project_id}_final.png", content_type="image/png")
+        
+        # Return raw binary to frontend blob downloader
+        buffer.seek(0)
+        return StreamingResponse(buffer, media_type="image/png")
+        
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Render error: {str(e)}")
 
 #download rendered image
 @app.get("/editor/rendered/{file_id}/download")
@@ -653,29 +709,40 @@ class Layer(BaseModel):
 
 class TemplateCreate(BaseModel):
     template_name: str
+    category: str = "social"
+    tags: List[str] = []
     width: int = 1080
     height: int = 1080
     background_color: str = "#FFFFFF"
-    layers: List[Layer] = []
+    layers: List[dict] = []
+    description: Optional[str] = None
 
-# 1) ADD NEW TEMPLATE
+# 1) ADD NEW TEMPLATE (both /templates/add and /templates/create)
 @app.post("/templates/add")
+@app.post("/templates/create")
 async def add_template(template: TemplateCreate):
     template_dict = template.dict()
     result = db.editor_templates.insert_one(template_dict)
     return {"status": "success", "template_id": str(result.inserted_id)}
 
-# 2) LIST ALL TEMPLATES
+# 2) LIST ALL TEMPLATES — enriched with all fields for SVG preview
 @app.get("/templates")
+@app.get("/templates/list")
 def list_templates():
     templates = []
     for t in db.editor_templates.find():
+        layers = t.get("layers", [])
         templates.append({
             "template_id": str(t["_id"]),
-            "template_name": t["template_name"],
-            "width": t["width"],
-            "height": t["height"],
-            "layers_count": len(t["layers"])
+            "template_name": t.get("template_name", "Untitled"),
+            "category": t.get("category", "social"),
+            "tags": t.get("tags", []),
+            "width": t.get("width", 1080),
+            "height": t.get("height", 1080),
+            "background_color": t.get("background_color", "#FFFFFF"),
+            "layers_count": len(layers),
+            "layers": layers,
+            "description": t.get("description", ""),
         })
     return {"status": "success", "templates": templates}
 
@@ -709,7 +776,7 @@ def apply_template_to_project(project_id: str, template_id: str):
 
     return {"status": "success", "added_layers": len(new_layers)}
 
-#   PRE-POPULATE TEMPLATES
+#   PRE-POPULATE TEMPLATES WITH RICH DATA
 @app.on_event("startup")
 def create_default_templates():
     existing = db.editor_templates.count_documents({})
@@ -717,47 +784,74 @@ def create_default_templates():
         print(f"Templates already exist: {existing}")
         return
 
-    templates = []
+    def tpl(name, category, tags, bg, w, h, layers):
+        return {"template_name": name, "category": category, "tags": tags,
+                "width": w, "height": h, "background_color": bg, "layers": [
+                    {**l, "layer_id": str(ObjectId()), "rotation": l.get("rotation", 0),
+                     "opacity": l.get("opacity", 1.0)} for l in layers]}
 
-    # 1) Centered Hero
-    templates.append({
-        "template_name": "Centered Hero",
-        "width": 1080,
-        "height": 1080,
-        "background_color": "#FFFFFF",
-        "layers": [
-            {"type": "image", "file_id": "", "x": 200, "y": 200, "width": 680, "height": 680, "rotation": 0, "opacity": 1.0, "layer_id": str(ObjectId())},
-            {"type": "text", "text": "Your Headline Here", "font_size": 64, "color": "#000000", "x": 150, "y": 920, "rotation": 0, "layer_id": str(ObjectId())},
-            {"type": "text", "text": "Shop Now", "font_size": 48, "color": "#000000", "x": 380, "y": 1000, "rotation": 0, "layer_id": str(ObjectId())}
-        ]
-    })
+    templates = [
+        tpl("Centered Hero", "social", ["instagram", "square"], "#1a1a2e", 1080, 1080,
+            [{"type":"image","file_id":"","x":200,"y":120,"width":680,"height":680},
+             {"type":"text","text":"Your Product Name","font_size":72,"color":"#FFFFFF","x":120,"y":840},
+             {"type":"text","text":"Shop Now →","font_size":42,"color":"#E94560","x":380,"y":940}]),
 
-    # 2) Left Hero + Right Text
-    templates.append({
-        "template_name": "Left Hero + Right Text",
-        "width": 1080,
-        "height": 1080,
-        "background_color": "#FFFFFF",
-        "layers": [
-            {"type": "image", "file_id": "", "x": 100, "y": 200, "width": 500, "height": 500, "rotation": 0, "layer_id": str(ObjectId())},
-            {"type": "text", "text": "Your Headline Here", "font_size": 60, "color": "#000000", "x": 650, "y": 250, "rotation": 0, "layer_id": str(ObjectId())},
-            {"type": "text", "text": "Shop Now", "font_size": 46, "color": "#000000", "x": 650, "y": 350, "rotation": 0, "layer_id": str(ObjectId())}
-        ]
-    })
+        tpl("Left Hero + Right Text", "social", ["instagram", "square", "product"], "#F5F5F0", 1080, 1080,
+            [{"type":"image","file_id":"","x":40,"y":140,"width":480,"height":800},
+             {"type":"text","text":"New Arrival","font_size":32,"color":"#E94560","x":570,"y":200},
+             {"type":"text","text":"Product Headline","font_size":80,"color":"#1a1a2e","x":560,"y":260},
+             {"type":"text","text":"Shop the collection today","font_size":36,"color":"#666","x":560,"y":460},
+             {"type":"text","text":"BUY NOW","font_size":40,"color":"#FFFFFF","x":570,"y":560}]),
 
-    # 3) Full Background + Floating Product
-    templates.append({
-        "template_name": "Full Background",
-        "width": 1080,
-        "height": 1080,
-        "background_color": "#FFFFFF",
-        "layers": [
-            {"type": "image", "file_id": "", "x": 240, "y": 240, "width": 600, "height": 600, "rotation": 0, "opacity": 1.0, "layer_id": str(ObjectId())},
-            {"type": "text", "text": "Your Headline Here", "font_size": 62, "color": "#000000", "x": 100, "y": 900, "rotation": 0, "layer_id": str(ObjectId())}
-        ]
-    })
+        tpl("Instagram Story", "story", ["instagram", "story", "portrait"], "#0f3460", 1080, 1920,
+            [{"type":"image","file_id":"","x":90,"y":300,"width":900,"height":900},
+             {"type":"text","text":"Limited Offer","font_size":52,"color":"#F5A623","x":100,"y":100},
+             {"type":"text","text":"SALE","font_size":180,"color":"#FFFFFF","x":200,"y":1260},
+             {"type":"text","text":"Up to 50% Off","font_size":60,"color":"#FFFFFF","x":200,"y":1470},
+             {"type":"text","text":"Swipe Up to Shop","font_size":44,"color":"#F5A623","x":270,"y":1720}]),
+
+        tpl("Facebook Ad Banner", "display", ["facebook", "banner", "landscape"], "#16213e", 1200, 628,
+            [{"type":"image","file_id":"","x":40,"y":64,"width":500,"height":500},
+             {"type":"text","text":"Exclusive Deal","font_size":48,"color":"#F5A623","x":600,"y":100},
+             {"type":"text","text":"Save Big Today","font_size":72,"color":"#FFFFFF","x":600,"y":180},
+             {"type":"text","text":"Limited time offer. Shop now.","font_size":32,"color":"#ccc","x":600,"y":310},
+             {"type":"text","text":"SHOP NOW","font_size":40,"color":"#FFFFFF","x":620,"y":440}]),
+
+        tpl("E-Commerce Product Card", "ecommerce", ["product", "card", "shop"], "#FAFAFA", 800, 1000,
+            [{"type":"image","file_id":"","x":100,"y":60,"width":600,"height":550},
+             {"type":"text","text":"Product Name","font_size":52,"color":"#1a1a2e","x":80,"y":660},
+             {"type":"text","text":"£29.99","font_size":64,"color":"#E94560","x":80,"y":740},
+             {"type":"text","text":"★★★★★  4.8 Reviews","font_size":28,"color":"#888","x":80,"y":830},
+             {"type":"text","text":"ADD TO BASKET","font_size":36,"color":"#FFFFFF","x":200,"y":900}]),
+
+        tpl("Tesco In-Store Label", "instore", ["tesco", "shelf", "price"], "#EE1C25", 400, 300,
+            [{"type":"text","text":"TESCO","font_size":52,"color":"#FFFFFF","x":130,"y":20},
+             {"type":"image","file_id":"","x":20,"y":80,"width":160,"height":160},
+             {"type":"text","text":"Product Name","font_size":28,"color":"#FFFFFF","x":200,"y":100},
+             {"type":"text","text":"£1.99","font_size":72,"color":"#FFD700","x":200,"y":160},
+             {"type":"text","text":"per unit","font_size":22,"color":"#FFF","x":240,"y":250}]),
+
+        tpl("Promotional Overlay", "social", ["sale", "promo", "bold"], "#E94560", 1080, 1080,
+            [{"type":"image","file_id":"","x":0,"y":0,"width":1080,"height":1080,"opacity":0.35},
+             {"type":"text","text":"FLASH","font_size":200,"color":"#FFFFFF","x":80,"y":200},
+             {"type":"text","text":"SALE","font_size":200,"color":"#FFD700","x":80,"y":440},
+             {"type":"text","text":"50% OFF","font_size":110,"color":"#FFFFFF","x":100,"y":700},
+             {"type":"text","text":"Today Only","font_size":44,"color":"#fff","x":100,"y":870}]),
+
+        tpl("Email Header Banner", "email", ["email", "header", "wide"], "#0f3460", 600, 200,
+            [{"type":"image","file_id":"","x":20,"y":20,"width":160,"height":160},
+             {"type":"text","text":"Your Brand Name","font_size":48,"color":"#FFFFFF","x":200,"y":50},
+             {"type":"text","text":"Exclusive member offers inside →","font_size":26,"color":"#F5A623","x":200,"y":120}]),
+
+        tpl("YouTube Thumbnail", "video", ["youtube", "thumbnail", "video"], "#16213e", 1280, 720,
+            [{"type":"image","file_id":"","x":600,"y":60,"width":640,"height":600},
+             {"type":"text","text":"YOU WON'T","font_size":100,"color":"#FFD700","x":40,"y":120},
+             {"type":"text","text":"BELIEVE","font_size":100,"color":"#FFFFFF","x":40,"y":240},
+             {"type":"text","text":"THIS!","font_size":100,"color":"#E94560","x":40,"y":360}]),
+    ]
 
     db.editor_templates.insert_many(templates)
+    print(f"Seeded {len(templates)} rich templates.")
     print("Default templates inserted successfully!")
 
 #   REAL-TIME COMPLIANCE ENGINE
@@ -865,11 +959,25 @@ def compliance_check(project_id: str, retailer: str = "RetailerA"):
         raise HTTPException(status_code=404, detail="Retailer guideline not found")
 
     rules = guideline["rules"]
-    proj = db.editor_projects.find_one({"_id": ObjectId(project_id)})
+    try:
+        pid = ObjectId(project_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid project ID format")
+    proj = db.editor_projects.find_one({"_id": pid})
     if not proj:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    canvas_img = render_project_image(project_id)
+    # Guard: empty project
+    if not proj.get("layers"):
+        return {"status": "success", "violations": [], "info": "No layers to check"}
+
+    try:
+        canvas_img = render_project_image(project_id)
+        canvas_is_blank = np.std(np.array(canvas_img)) < 5
+    except Exception:
+        canvas_img = None
+        canvas_is_blank = True
+
     violations = []
 
     # 1) resolution check
@@ -1549,7 +1657,118 @@ def delete_review(review_id: str):
 # HEALTH CHECK
 @app.get("/")
 def health():
-    return {"message": "ReTailor AI Backend Running", "status": "OK"}
+    return {"message": "ReTailor AI Backend Running", "status": "OK", "mistral": "configured" if mistral_client else "not configured"}
+
+# ── MISTRAL AI ENDPOINTS ──────────────────────────────────────────────────────
+
+class ComplianceAIRequest(BaseModel):
+    project_id: str
+    retailer: str = "RetailerA"
+
+@app.post("/ai/compliance-advice")
+def ai_compliance_advice(req: ComplianceAIRequest):
+    """Use Mistral to give natural-language compliance improvement advice."""
+    if not mistral_client:
+        raise HTTPException(status_code=503, detail="Mistral API key not configured")
+    try:
+        pid = ObjectId(req.project_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid project ID format")
+    proj = db.editor_projects.find_one({"_id": pid})
+    if not proj:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    layers_summary = []
+    for l in proj.get("layers", []):
+        if l.get("type") == "text":
+            layers_summary.append(f"Text: '{l.get('text','')}' size={l.get('font_size',0)}px color={l.get('color','#000')} at ({l.get('x',0)},{l.get('y',0)})")
+        else:
+            layers_summary.append(f"Image at ({l.get('x',0)},{l.get('y',0)}) size {l.get('width',0)}x{l.get('height',0)}")
+
+    prompt = f"""You are a retail advertising compliance expert for {req.retailer}.
+Analyse this creative design and provide specific, actionable compliance advice.
+
+Canvas: {proj.get('width',0)}x{proj.get('height',0)}px, background: {proj.get('background_color','#FFF')}
+Layers:
+{chr(10).join(layers_summary)}
+
+Provide compliance advice as JSON with this exact structure:
+{{
+  "overall_score": 75,
+  "summary": "one sentence overall assessment",
+  "issues": [{{"severity": "high|medium|low", "issue": "what is wrong", "fix": "specific actionable fix"}}],
+  "strengths": ["list of compliant aspects"],
+  "recommended_next_steps": ["ordered list of improvements"]
+}}
+Return only valid JSON, no markdown wrapper."""
+
+    try:
+        response = mistral_client.chat.complete(
+            model="mistral-large-latest",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        import json
+        content = response.choices[0].message.content.strip()
+        if content.startswith("```"):
+            content = content.split("```")[1]
+            if content.startswith("json"):
+                content = content[4:]
+        advice = json.loads(content)
+        return {"status": "success", "advice": advice}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"AI compliance advice failed: {str(e)}")
+
+
+class CopySuggestionsRequest(BaseModel):
+    product_name: str
+    product_description: str = ""
+    tone: str = "professional"
+    platform: str = "instagram"
+
+@app.post("/ai/copy-suggestions")
+def ai_copy_suggestions(req: CopySuggestionsRequest):
+    """Generate ad copy suggestions using Mistral AI."""
+    if not mistral_client:
+        raise HTTPException(status_code=503, detail="Mistral API key not configured")
+
+    prompt = f"""Generate advertising copy for this product:
+Product: {req.product_name}
+Description: {req.product_description}
+Tone: {req.tone}
+Platform: {req.platform}
+
+Return JSON with this structure:
+{{
+  "headlines": ["headline 1", "headline 2", "headline 3"],
+  "taglines": ["tagline 1", "tagline 2"],
+  "cta_buttons": ["Shop Now", "Learn More", "Get Offer"],
+  "body_copy": "2-3 sentence product description"
+}}
+Return only valid JSON."""
+
+    try:
+        response = mistral_client.chat.complete(
+            model="mistral-large-latest",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        import json
+        content = response.choices[0].message.content.strip()
+        if content.startswith("```"):
+            content = content.split("```")[1]
+            if content.startswith("json"):
+                content = content[4:]
+        suggestions = json.loads(content)
+        return {"status": "success", "suggestions": suggestions}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"AI copy suggestions failed: {str(e)}")
+
+
+@app.post("/templates/reseed")
+def reseed_templates():
+    """Force re-seed templates (drops existing ones)."""
+    db.editor_templates.drop()
+    create_default_templates()
+    return {"status": "reseeded"}
 
 if __name__ == "__main__":
     import uvicorn
