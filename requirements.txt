@@ -1,0 +1,81 @@
+# ReTailor AI — Python Backend Requirements
+# Install with: pip install -r requirements.txt
+# Python version: 3.12+ required
+
+# ─── WEB FRAMEWORK ────────────────────────────────────────────────────────────
+fastapi==0.115.0                   # High-performance async REST API framework
+uvicorn[standard]==0.32.0          # ASGI server with WebSocket and HTTP/2 support
+python-multipart==0.0.9            # Multipart form / file upload support
+
+# ─── DATA VALIDATION ──────────────────────────────────────────────────────────
+pydantic==2.9.2                    # Schema validation and data modeling
+pydantic-settings==2.5.2           # Settings management from .env files
+
+# ─── ENVIRONMENT MANAGEMENT ───────────────────────────────────────────────────
+python-dotenv==1.0.1               # Load .env variables into environment
+
+# ─── DATABASE & STORAGE ───────────────────────────────────────────────────────
+pymongo==4.9.2                     # MongoDB Python driver
+motor==3.6.0                       # Async MongoDB driver (for async endpoints)
+dnspython==2.7.0                   # DNS resolution for MongoDB Atlas SRV URIs
+
+# ─── AI & LLM ─────────────────────────────────────────────────────────────────
+mistralai==1.2.0                   # Mistral AI Python SDK (layout, copy, compliance, poster)
+huggingface-hub==0.26.2            # HuggingFace Hub client (FLUX inference API)
+requests==2.32.3                   # HTTP client for HuggingFace Inference API calls
+
+# ─── IMAGE PROCESSING ─────────────────────────────────────────────────────────
+Pillow==10.4.0                     # PIL image processing (canvas rendering, layer composition)
+opencv-python==4.10.0.84           # OpenCV (GrabCut background removal, enhancement pipeline)
+rembg==2.0.57                      # Neural network background removal (U2Net)
+numpy==2.1.2                       # Pixel-level operations for enhancement pipeline
+scikit-image==0.24.0               # Additional image analysis utilities
+onnxruntime==1.19.2                # ONNX runtime for rembg model inference
+
+# ─── DOCUMENT PROCESSING ──────────────────────────────────────────────────────
+PyPDF2==3.0.1                      # PDF text extraction for poster generator pipeline
+python-docx==1.1.2                 # DOCX content parsing for poster generator pipeline
+
+# ─── ASYNC & UTILITIES ────────────────────────────────────────────────────────
+aiofiles==24.1.0                   # Async file I/O
+httpx==0.27.2                      # Modern async HTTP client
+
+# ─── SERIALIZATION ────────────────────────────────────────────────────────────
+ujson==5.10.0                      # Fast JSON serialization
+orjson==3.10.10                    # Ultra-fast JSON (used internally by FastAPI)
+
+# ─── REAL-TIME / WEBSOCKETS ───────────────────────────────────────────────────
+# WebSocket support is included in uvicorn[standard] and FastAPI natively
+websockets==13.1                   # WebSocket protocol implementation
+
+# ─── DEVELOPMENT & TESTING ────────────────────────────────────────────────────
+pytest==8.3.3                      # Test framework
+pytest-asyncio==0.24.0             # Async test support for FastAPI endpoints
+httpx==0.27.2                      # HTTP test client for FastAPI TestClient
+black==24.10.0                     # Code formatter
+isort==5.13.2                      # Import organizer
+flake8==7.1.1                      # Linting
+
+# ─── PRODUCTION ───────────────────────────────────────────────────────────────
+gunicorn==23.0.0                   # Production WSGI/ASGI process manager
+
+# ─── PLATFORM NOTES ───────────────────────────────────────────────────────────
+# OpenCV on headless Linux servers (Render, Railway, EC2):
+#   Use: opencv-python-headless instead of opencv-python
+#   pip install opencv-python-headless
+#
+# rembg model download (U2Net, ~170MB):
+#   Downloaded automatically on first use from HuggingFace Hub
+#   Set REMBG_HOME env var to cache in a persistent location:
+#   export REMBG_HOME=/path/to/model/cache
+#
+# OpenCV on macOS (if cv2 import fails):
+#   brew install opencv
+#   pip install opencv-python
+#
+# OpenCV on Ubuntu/Debian (libGL error):
+#   sudo apt-get install libgl1-mesa-glx libglib2.0-0 libsm6 libxext6 libxrender-dev
+#
+# Python version pinning:
+#   The backend uses .python-version file to pin Python 3.12
+#   Ensure your venv and Render/Railway environment uses 3.12+
