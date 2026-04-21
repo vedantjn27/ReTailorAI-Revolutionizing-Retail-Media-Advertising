@@ -20,7 +20,7 @@ import cv2
 import zipfile
 from datetime import datetime
 import PyPDF2
-import docx
+import docx 
 import requests
 from fastapi import Form
 
