@@ -1,6 +1,6 @@
 # ReTailor AI — Features, Impact & Uniqueness
 
-> A deep-dive into every feature: what it does, why it exists, what makes it different, and who benefits.
+> A deep-dive into every feature: what it does, why it exists, what makes it different, and who benefits. 
 
 ---
 
